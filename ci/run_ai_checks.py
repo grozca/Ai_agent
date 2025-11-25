@@ -1,232 +1,361 @@
+#!/usr/bin/env python
+"""
+AI code reviewer integrado con Ollama.
+
+- Obtiene el diff de git del último commit (con fallback si no hay HEAD~1).
+- Carga:
+    - ci/ai_checks.md  (reglas y esquema JSON)
+    - product_spec.md  (contexto del proyecto, si existe)
+- Intenta llamar a Ollama (modelo definido en .env).
+- Siempre imprime un JSON válido:
+    - Si la llamada a la IA funciona: usa la respuesta de la IA.
+    - Si falla o hay timeout: devuelve un JSON "fallback" marcando el error.
+
+Requisitos:
+    pip install requests python-dotenv
+    Ollama corriendo y modelo instalado (ej: llama3:8b):
+        ollama run llama3:8b "Hola"
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import subprocess
-import sys
+import textwrap
 from pathlib import Path
+from typing import Tuple
+
+import requests
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Cargar variables de entorno (.env en la raíz del repo)
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+# Configuración principal
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+MAX_DIFF_CHARS = int(os.getenv("AI_REVIEW_MAX_DIFF_CHARS", "2000"))
+REQUEST_TIMEOUT = int(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "300"))
+
+# Si AI_REVIEW_STRICT=1, un fallo de la IA hace fallar el CI.
+STRICT_MODE = os.getenv("AI_REVIEW_STRICT", "0") == "1"
 
 
-def get_diff() -> str:
+# ---------------------------------------------------------------------------
+# Utilidades shell/Git
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd: list[str], cwd: str | None = None) -> Tuple[int, str, str]:
+    """Ejecuta un comando y devuelve (returncode, stdout, stderr)."""
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def get_git_diff() -> str:
     """
-    Get the diff for the current PR or local changes.
-    - In CI: use BASE_BRANCH (e.g. origin/develop) vs HEAD.
-    - Locally: just use `git diff` against the working tree.
+    Obtiene un diff útil para revisar.
+
+    Prioridad:
+    1. Diff entre HEAD~1 y HEAD (último commit).
+    2. Diff de cambios sin commitear.
+    3. Mensaje de error explicando qué pasó.
     """
-    base_branch = os.getenv("BASE_BRANCH")
+    # 1) Intentar diff entre HEAD~1 y HEAD
+    rc, _, _ = run_cmd(["git", "rev-parse", "HEAD~1"])
+    if rc == 0:
+        rc, out, err = run_cmd(["git", "diff", "--unified=0", "HEAD~1"])
+        if rc == 0 and out.strip():
+            return out
 
-    try:
-        if base_branch:
-            # CI mode: compare base branch with HEAD
-            diff_cmd = ["git", "diff", base_branch, "HEAD"]
-        else:
-            # Local mode: show unstaged/staged changes
-            diff_cmd = ["git", "diff"]
+    # 2) Fallback: diff de cambios actuales sin commitear
+    rc, out, err = run_cmd(["git", "diff", "--unified=0"])
+    if rc == 0 and out.strip():
+        header = "# Fallback diff (no se pudo usar HEAD~1)\n"
+        return header + out
 
-        diff = subprocess.check_output(diff_cmd, text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as e:
-        print("[WARN] Error while getting diff:")
-        print(e.output)
-        return "No diff could be obtained. This may be a fresh repo with no git history yet."
+    # 3) Nada útil: devolver explicación + git status
+    status_rc, status_out, status_err = run_cmd(
+        ["git", "status", "--short", "--branch"]
+    )
+    msg = textwrap.dedent(
+        f"""
+        No se pudo obtener un diff útil para revisar.
 
-    diff = diff.strip()
-    if not diff:
-        return "No relevant changes detected in the diff."
-    return diff
+        Último error de git:
+        {err or status_err}
 
-
-def load_file(path: Path) -> str:
-    """Load a text file, return empty string if not found."""
-    if not path.exists():
-        print(f"[WARN] File not found: {path}")
-        return ""
-    return path.read_text(encoding="utf-8")
+        Salida de 'git status --short --branch':
+        {status_out}
+        """
+    ).strip()
+    return msg
 
 
-def build_prompt(product_spec: str, ai_checks: str, diff: str) -> str:
+# ---------------------------------------------------------------------------
+# Carga de documentos (reglas y spec)
+# ---------------------------------------------------------------------------
+
+def load_ai_checks_document() -> str:
     """
-    Build the prompt that will be sent to the LLM.
-    This combines project specification, AI checks instructions and the code diff.
-    """
-    parts = []
+    Carga el documento de reglas de revisión (AI checks document).
 
-    parts.append("You are an automated code reviewer integrated into a CI pipeline.")
-    parts.append(
-        "You must strictly follow the instructions and output format defined in the AI checks document."
+    Prioridad:
+    - ci/ai_checks.md
+    - .github/ai-checks.md
+    """
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "ai_checks.md",
+        script_dir.parent / ".github" / "ai-checks.md",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            print(f"[DEBUG] Usando AI checks de: {path}")
+            return path.read_text(encoding="utf-8")
+
+    raise FileNotFoundError(
+        "No se encontró ci/ai_checks.md ni .github/ai-checks.md. "
+        "Se necesita uno de estos para saber las reglas y el formato JSON."
     )
 
-    if product_spec:
-        parts.append("\n--- PROJECT SPECIFICATION ---\n")
-        parts.append(product_spec)
 
-    if ai_checks:
-        parts.append("\n--- AI CHECKS DOCUMENT ---\n")
-        parts.append(ai_checks)
-
-    parts.append("\n--- DIFF TO REVIEW ---\n")
-    parts.append("The following is the unified diff of the code changes:")
-    parts.append("\n```diff\n")
-    parts.append(diff)
-    parts.append("\n```\n")
-
-    full_prompt = "\n".join(parts)
-    return full_prompt
-
-
-def call_llm(prompt: str) -> str:
+def load_product_spec() -> str:
     """
-    Placeholder for the LLM call.
+    Carga product_spec.md si existe, para dar contexto del proyecto.
 
-    For now, this runs in 'dry-run' mode:
-    - If no OPENAI_API_KEY is set, it returns a dummy JSON.
-    - When the key and client are available, this function can be updated
-      to actually call the model.
+    Busca en:
+    - product_spec.md en la raíz
+    - docs/product_spec.md
     """
-    api_key = os.getenv("OPENAI_API_KEY")
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent
 
-    if not api_key:
-        print("[INFO] No OPENAI_API_KEY found. Running in dry-run mode.")
-        # Dummy response: everything passes
-        dummy_result = {
-            "overall_status": "pass",
-            "checks": [
-                {
-                    "name": "readability",
-                    "status": "pass",
-                    "details": "Dry-run: no real evaluation performed.",
-                },
-                {
-                    "name": "security_basic",
-                    "status": "pass",
-                    "details": "Dry-run: no real evaluation performed.",
-                },
-                {
-                    "name": "consistency_with_project",
-                    "status": "pass",
-                    "details": "Dry-run: no real evaluation performed.",
-                },
-                {
-                    "name": "tests",
-                    "status": "pass",
-                    "details": "Dry-run: no real evaluation performed.",
-                },
-            ],
-            "notes": ["Dry-run mode: LLM was not called."],
-        }
-        return json.dumps(dummy_result)
+    candidates = [
+        repo_root / "product_spec.md",
+        repo_root / "docs" / "product_spec.md",
+    ]
 
-    # When you get the key and choose a client (OpenAI, etc.), you can implement:
-    #
-    # from openai import OpenAI
-    # client = OpenAI(api_key=api_key)
-    #
-    # response = client.chat.completions.create(
-    #     model="gpt-4.1-mini",
-    #     messages=[
-    #         {"role": "system", "content": "You are a strict automated code reviewer."},
-    #         {"role": "user", "content": prompt},
-    #     ],
-    #     temperature=0,
-    # )
-    # content = response.choices[0].message.content
-    #
-    # return content
-    #
-    # For now, even if the key exists, we still return a dummy payload:
+    for path in candidates:
+        if path.exists():
+            print(f"[DEBUG] Usando product spec de: {path}")
+            return path.read_text(encoding="utf-8")
 
-    print("[INFO] OPENAI_API_KEY is set, but LLM call is not implemented yet. Returning dummy result.")
-    dummy_result = {
-        "overall_status": "pass",
-        "checks": [
-            {
-                "name": "readability",
-                "status": "pass",
-                "details": "Placeholder result. Implement LLM call to get real evaluation.",
-            },
-            {
-                "name": "security_basic",
-                "status": "pass",
-                "details": "Placeholder result. Implement LLM call to get real evaluation.",
-            },
-            {
-                "name": "consistency_with_project",
-                "status": "pass",
-                "details": "Placeholder result. Implement LLM call to get real evaluation.",
-            },
-            {
-                "name": "tests",
-                "status": "pass",
-                "details": "Placeholder result. Implement LLM call to get real evaluation.",
-            },
-        ],
-        "notes": ["LLM call not implemented yet; this is a placeholder response."],
+    print("[DEBUG] No se encontró product_spec.md, se continúa sin contexto extra.")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Cliente de Ollama
+# ---------------------------------------------------------------------------
+
+def call_ollama(
+    prompt: str,
+    model: str = DEFAULT_OLLAMA_MODEL,
+    url: str = DEFAULT_OLLAMA_URL,
+    temperature: float = 0.1,
+) -> str:
+    """
+    Llama a Ollama usando /api/generate (sin streaming) y devuelve el campo 'response'.
+    """
+    api_url = url.rstrip("/") + "/api/generate"
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+        },
     }
-    return json.dumps(dummy_result)
+
+    print(f"[DEBUG] Llamando a Ollama en {api_url} con modelo '{model}'...")
+    print(f"[DEBUG] Timeout configurado: {REQUEST_TIMEOUT} segundos")
+    resp = requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT)
+    print("[DEBUG] Respuesta recibida de Ollama.")
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response", "").strip()
 
 
-def main() -> None:
-    # 1. Load documentation
-    product_spec_path = Path("docs/product_spec.md")
-    ai_checks_path = Path("ci/ai_checks.md")
+# ---------------------------------------------------------------------------
+# Construcción del prompt
+# ---------------------------------------------------------------------------
 
-    product_spec = load_file(product_spec_path)
-    ai_checks = load_file(ai_checks_path)
+def build_review_prompt(ai_checks_doc: str, product_spec: str, diff: str) -> str:
+    """
+    Construye el prompt principal para el modelo.
+    """
+    trimmed_diff = diff
+    if len(trimmed_diff) > MAX_DIFF_CHARS:
+        trimmed_diff = trimmed_diff[:MAX_DIFF_CHARS]
+        trimmed_diff += (
+            f"\n\n[Diff truncado a {MAX_DIFF_CHARS} caracteres para ajustarse al contexto.]"
+        )
 
-    # 2. Get diff
-    diff = get_diff()
+    prompt = f"""
+    You are an automated code reviewer integrated into a CI pipeline.
 
-    print("=== Diff preview (first 2000 characters) ===")
-    print(diff[:2000])
-    print("\n=== End of diff preview ===\n")
+    You MUST strictly follow the instructions and JSON output format defined
+    in the AI checks document.
 
-    # 3. Build prompt
-    prompt = build_prompt(product_spec, ai_checks, diff)
+    --- PROJECT SPECIFICATION (CONTEXT) ---
+    {product_spec}
+    --- END PROJECT SPECIFICATION ---
 
-    # (Optional) Debug: see part of the prompt
-    print("=== Prompt preview (first 3000 characters) ===")
-    print(prompt[:3000])
-    print("\n=== End of prompt preview ===\n")
+    --- AI CHECKS DOCUMENT (RULES + REQUIRED JSON SCHEMA) ---
+    {ai_checks_doc}
+    --- END AI CHECKS DOCUMENT ---
 
-    # 4. Call LLM (currently dry-run)
-    raw_output = call_llm(prompt)
+    --- DIFF TO REVIEW ---
+    {trimmed_diff}
+    --- END DIFF ---
 
-    print("=== Raw model output ===")
-    print(raw_output)
-    print("=== End of model output ===\n")
+    VERY IMPORTANT INSTRUCTIONS:
 
-    # 5. Try to parse JSON
+    - Your output MUST be VALID RAW JSON, with NO markdown formatting.
+    - DO NOT wrap your response in triple backticks (```json or ```).
+    - DO NOT add explanations before or after the JSON.
+    - DO NOT include comments in the JSON.
+    - The JSON MUST be directly parseable by Python's json.loads().
+    - The JSON MUST follow the exact schema described in the AI checks document
+      (including overall_status, checks, notes, etc.).
+    - Base your evaluation ONLY on:
+        - The diff provided
+        - The AI checks document
+        - The project specification
+    - Answer explanations in Spanish where appropriate, but keep code identifiers,
+      function names and technical terms in English.
+    """
+
+    return textwrap.dedent(prompt).strip()
+
+
+# ---------------------------------------------------------------------------
+# Limpieza y parseo del JSON
+# ---------------------------------------------------------------------------
+
+def clean_and_parse_json(response: str) -> dict:
+    """
+    Limpia la respuesta del modelo (quitando ```json ... ``` si existe)
+    y devuelve un dict JSON parseado.
+    """
+    raw = response.strip()
+
+    # 1) Si viene envuelto en ```...``` lo limpiamos
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        if len(parts) >= 2:
+            raw = parts[1].strip()
+        else:
+            raw = raw.replace("```", "").strip()
+
+    # 2) Extraer solo lo que hay entre { ... }
+    if "{" in raw and "}" in raw:
+        raw = raw[raw.find("{") : raw.rfind("}") + 1]
+
+    # 3) Intentar parsear el JSON
+    parsed = json.loads(raw)  # si falla, que lance la excepción
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Fallback JSON (cuando la IA falla)
+# ---------------------------------------------------------------------------
+
+def build_fallback_result(error_message: str) -> dict:
+    """
+    Construye un JSON mínimo válido cuando no se puede llamar a la IA.
+    """
+    return {
+        "overall_status": "unknown",
+        "checks": [],
+        "notes": [
+            "AI reviewer no pudo ejecutarse correctamente.",
+            f"Detalle técnico: {error_message}",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    print("[DEBUG] Modelo cargado de .env:", os.getenv("OLLAMA_MODEL"))
+    print("[DEBUG] URL de Ollama:", os.getenv("OLLAMA_URL"))
+
+    print("=== AI Reviewer (Ollama) ===")
+    print(f"Modelo: {DEFAULT_OLLAMA_MODEL}")
+    print(f"Endpoint: {DEFAULT_OLLAMA_URL}")
+
     try:
-        result = json.loads(raw_output)
-    except json.JSONDecodeError:
-        print("[ERROR] Model output is not valid JSON. Failing the check.")
-        sys.exit(1)
+        ai_checks_doc = load_ai_checks_document()
+    except FileNotFoundError as e:
+        print("❌", e)
+        fallback = build_fallback_result(str(e))
+        print("=== AI REVIEW JSON START ===")
+        print(json.dumps(fallback, indent=2, ensure_ascii=False))
+        print("=== AI REVIEW JSON END ===")
+        return 1 if STRICT_MODE else 0
 
-    overall_status = result.get("overall_status", "fail")
-    checks = result.get("checks", [])
-    notes = result.get("notes", [])
+    product_spec = load_product_spec()
+    diff = get_git_diff()
 
-    print("=== Parsed result ===")
-    print(json.dumps(result, indent=2))
-    print("=== End of parsed result ===\n")
+    if not diff.strip():
+        print("No se encontraron cambios para revisar (diff vacío).")
+        no_changes = {
+            "overall_status": "pass",
+            "checks": [],
+            "notes": ["No se encontraron cambios para revisar."],
+        }
+        print("=== AI REVIEW JSON START ===")
+        print(json.dumps(no_changes, indent=2, ensure_ascii=False))
+        print("=== AI REVIEW JSON END ===")
+        return 0
 
-    # 6. Decide CI status
-    if overall_status != "pass":
-        print("❌ AI review failed according to overall_status.")
-        print("Failed checks:")
-        for c in checks:
-            if c.get("status") == "fail":
-                print(f"- {c.get('name')}: {c.get('details')}")
-        if notes:
-            print("\nNotes:")
-            for n in notes:
-                print(f"- {n}")
-        sys.exit(1)
+    print(
+        f"[DEBUG] Longitud del diff: {len(diff)} caracteres "
+        f"(se recorta a {MAX_DIFF_CHARS})"
+    )
 
-    print("✅ AI review passed (dummy mode).")
-    if notes:
-        print("Notes:")
-        for n in notes:
-            print(f"- {n}")
-    sys.exit(0)
+    prompt = build_review_prompt(ai_checks_doc, product_spec, diff)
+
+    # Intentar llamada a la IA
+    try:
+        response = call_ollama(prompt)
+        parsed = clean_and_parse_json(response)
+    except (requests.Timeout, requests.RequestException, json.JSONDecodeError) as exc:
+        print(f"❌ Error al llamar a la IA o parsear JSON: {exc}")
+        parsed = build_fallback_result(str(exc))
+        exit_code = 1 if STRICT_MODE else 0
+    else:
+        overall_status = parsed.get("overall_status")
+        if overall_status == "fail":
+            print("❌ overall_status = fail → marcando revisión como FALLIDA (exit 1).")
+            exit_code = 1
+        else:
+            print("✅ overall_status != fail → revisión OK (exit 0).")
+            exit_code = 0
+
+    print("=== AI REVIEW JSON START ===")
+    print(json.dumps(parsed, indent=2, ensure_ascii=False))
+    print("=== AI REVIEW JSON END ===")
+
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
